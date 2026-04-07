@@ -2,15 +2,11 @@
 
 # ==============================================================================
 # VPS 通用初始化脚本 (适用于 Debian & Ubuntu LTS)
-# 版本: 7.9.15
+# 版本: 7.9.16 (BBR 参数深度优化版)
 # ------------------------------------------------------------------------------
-# 改进日志 (v7.9.15):
-# - [FIX] 修正 'parse_args' 函数中一个不影响功能的变量名笔误
-#
-# 改进日志 (v7.9.14):
-# - [健壮] 'configure_time_sync' 现在会优先尝试启用 'systemd-timesyncd'，
-#   如果失败，则尝试 'apt-get install systemd-timesyncd'，然后再次尝试启用。
-# - [健壮] 修正 'verify_time_sync' 逻辑，将 'chrony' 视为警告 (WARN)
+# 改进日志 (v7.9.16):
+# - [优化] configure_bbr: 引入 tcp_tw_reuse, tcp_slow_start_after_idle 等关键参数
+# - [优化] configure_bbr: 补全 TCP 读写缓冲区配置，提升高带宽下的吞吐性能
 # ==============================================================================
 set -euo pipefail
 
@@ -237,7 +233,6 @@ verify_dns() {
     record_verification "DNS" "$status" "$message"
 }
 
-# [修改] 验证时间同步 (v7.9.14)
 verify_time_sync() {
     if (timedatectl status 2>/dev/null | grep -q 'NTP service: active'); then
         record_verification "时间同步" "PASS" "systemd-timesyncd (NTP) 已激活"
@@ -258,7 +253,7 @@ run_verification() {
     set +e
     [[ -n "$NEW_HOSTNAME" ]] && verify_config "主机名" "$NEW_HOSTNAME" "$(hostname)"
     verify_config "时区" "$TIMEZONE" "$(timedatectl show --property=Timezone --value 2>/dev/null || echo 'N/A')"
-    verify_time_sync # [新增]
+    verify_time_sync
     verify_bbr
     verify_swap
     verify_dns
@@ -290,23 +285,23 @@ usage() {
     cat << EOF
 ${YELLOW}用法: $0 [选项]${NC}
 ${BLUE}核心选项:${NC}
-  --hostname <name>     设置主机名
-  --timezone <tz>       设置时区
-  --swap <size_mb>      设置Swap大小，'auto'/'0'
-  --ip-dns <'主 备'>     设置IPv4 DNS
-  --ip6-dns <'主 备'>    设置IPv6 DNS
+  --hostname <name>      设置主机名
+  --timezone <tz>        设置时区
+  --swap <size_mb>       设置Swap大小，'auto'/'0'
+  --ip-dns <'主 备'>      设置IPv4 DNS
+  --ip6-dns <'主 备'>     设置IPv6 DNS
 ${BLUE}BBR选项:${NC}
-  --bbr                 启用默认BBR (默认)
-  --bbr-optimized       启用优化BBR (高配置)
-  --no-bbr              禁用BBR
+  --bbr                  启用默认BBR (默认)
+  --bbr-optimized        启用优化BBR (高配置)
+  --no-bbr               禁用BBR
 ${BLUE}安全选项:${NC}
-  --fail2ban [port]     启用Fail2ban
-  --no-fail2ban         禁用Fail2ban
-  --ssh-port <port>     设置SSH端口
+  --fail2ban [port]      启用Fail2ban
+  --no-fail2ban          禁用Fail2ban
+  --ssh-port <port>      设置SSH端口
   --ssh-password <pass> 设置root密码
 ${BLUE}其他:${NC}
-  -h, --help            显示帮助
-  --non-interactive     非交互模式
+  -h, --help             显示帮助
+  --non-interactive      非交互模式
 ${GREEN}示例: $0 --bbr-optimized --ssh-port 2222${NC}
 EOF
     exit 0
@@ -507,38 +502,82 @@ configure_time_sync() {
     fi
 }
 
+# ==============================================================================
+# --- 重点修改区域：configure_bbr ---
+# ==============================================================================
 configure_bbr() {
-    log "\n${YELLOW}=============== 5. BBR配置 ===============${NC}"
+    log "\n${YELLOW}=============== 5. BBR配置 (优化版) ===============${NC}"
     local config_file="/etc/sysctl.d/99-bbr.conf"
+    
     if [[ "$BBR_MODE" = "none" ]]; then
         log "${BLUE}[INFO] 跳过BBR配置${NC}"
         rm -f "$config_file"
         sysctl -p >> "$LOG_FILE" 2>&1 || true
         return
     fi
+    
     if ! is_kernel_version_ge "4.9"; then
         log "${RED}[ERROR] 内核版本过低 ($(uname -r))，需要4.9+${NC}"
         return 1
     fi
+    
     local mem_mb=$(free -m | awk '/^Mem:/{print $2}')
     log "${BLUE}检测到内存: ${mem_mb}MB${NC}"
+    
     case "$BBR_MODE" in
         "optimized")
-            log "${BLUE}配置优化BBR...${NC}"
+            log "${BLUE}配置优化BBR (高性能参数)...${NC}"
+            
             if [[ $mem_mb -lt 1024 ]]; then
                 log "${YELLOW}[WARN] 内存较低，建议使用默认BBR模式${NC}"
             fi
-            local rmem_wmem=$((mem_mb > 2048 ? 67108864 : mem_mb > 1024 ? 33554432 : 16777216))
-            local somaxconn=$((mem_mb > 2048 ? 32768 : mem_mb > 1024 ? 16384 : 8192))
+            
+            # 动态计算参数 (根据内存分级)
+            local rmem_wmem somaxconn
+            if [[ $mem_mb -ge 4096 ]]; then
+                # 4GB+ 内存
+                rmem_wmem=67108864  # 64MB
+                somaxconn=65535
+            elif [[ $mem_mb -ge 1024 ]]; then
+                # 1GB-4GB 内存
+                rmem_wmem=33554432  # 32MB
+                somaxconn=32768
+            else
+                # <1GB 内存
+                rmem_wmem=16777216  # 16MB
+                somaxconn=16384
+            fi
+            
             cat > "$config_file" << EOF
+# --- BBR 核心 ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+
+# --- 缓冲区优化 (配合 TCP 读写) ---
 net.core.rmem_max = ${rmem_wmem}
 net.core.wmem_max = ${rmem_wmem}
+net.ipv4.tcp_rmem = 4096 87380 ${rmem_wmem}
+net.ipv4.tcp_wmem = 4096 65536 ${rmem_wmem}
+
+# --- 连接队列与积压 ---
 net.core.somaxconn = ${somaxconn}
 net.ipv4.tcp_max_syn_backlog = ${somaxconn}
-net.ipv4.tcp_fin_timeout = 15
+net.core.netdev_max_backlog = ${somaxconn}
+
+# --- 连接复用与超时 (关键优化) ---
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.ip_local_port_range = 10000 65535
+
+# --- 保活探测 ---
 net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+
+# --- 其他 ---
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_mtu_probing = 1
 EOF
             ;;
         *)
@@ -549,6 +588,7 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
             ;;
     esac
+    
     sysctl -p "$config_file" >> "$LOG_FILE" 2>&1
     log "${GREEN}✅ BBR配置完成${NC}"
 }
